@@ -1,0 +1,1 @@
+This directory includes the original Ro-ABSA dataset (labeled_data), the augmented training data (augmented_data) described in our paper, and the instances prepared for the few-shot learning experiments (few_shot_data).
