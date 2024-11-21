@@ -1,0 +1,78 @@
+Show statistics for train dataset <<manual_df_train_lbl_final.csv>>:
+
+Initial len: 5093
+No duplicates len: 5093
+Final len: 5093
+Final len: 5093
+
+Frequent unique categories:
+{'product': 1387, 'shop diversity': 1342, 'staff competency': 1173, 'shop organization': 843, 'service': 717, 'quality': 666, 'price': 566, 'environment': 359, 'staff availability': 249, 'delivery': 247, 'misc': 193, 'tech support': 132, 'promotions': 107, 'return warranty': 55, 'security': 27, 'accessibility': 2}
+Df name: Unique_manual_df_train_lbl_final.jpg
+Plot saved
+
+Show data origin distribution:
+[('manual', 5093)]
+
+--------------------
+Show statistics for train dataset <<df_lbl_final_ConcatMlmBt_onRareLbls.csv>>:
+
+Initial len: 6720
+No duplicates len: 6720
+Final len: 6720
+Final len: 6720
+
+Frequent unique categories:
+{'shop diversity': 1610, 'product': 1539, 'staff competency': 1397, 'shop organization': 1020, 'misc': 964, 'service': 851, 'quality': 816, 'price': 717, 'tech support': 702, 'promotions': 558, 'environment': 452, 'delivery': 350, 'staff availability': 287, 'return warranty': 277, 'security': 142, 'accessibility': 10}
+Df name: Unique_df_lbl_final_ConcatMlmBt_onRareLbls.jpg
+Plot saved
+
+Show data origin distribution:
+[('manual', 5093), ('bt_1chain', 511), ('bt_2chain', 511), ('concat', 488), ('mlm', 117)]
+
+--------------------
+
+Show statistics for train dataset <<df_lbl_final_ConcatMlmBt_onALMOSTRareLbls.csv>>:
+
+Initial len: 17477
+No duplicates len: 17467
+Final len: 17467
+Final len: 17467
+
+Frequent unique categories:
+{'shop diversity': 6987, 'staff competency': 6043, 'shop organization': 4381, 'service': 3630, 'product': 2694, 'environment': 1888, 'price': 1844, 'quality': 1815, 'staff availability': 1321, 'delivery': 1277, 'misc': 964, 'tech support': 702, 'promotions': 558, 'return warranty': 278, 'security': 141, 'accessibility': 10}
+Df name: Unique_df_lbl_final_ConcatMlmBt_onALMOSTRareLbls.jpg
+Plot saved
+
+Show data origin distribution:
+[('manual', 5093), ('bt_1chain', 3874), ('bt_2chain', 3868), ('concat', 3691), ('mlm', 941)]
+
+--------------------
+Show statistics for train dataset <<roabsa_test.csv>>:
+
+Initial len: 556
+No duplicates len: 556
+Final len: 556
+
+Frequent unique categories:
+{'product': 180, 'shop diversity': 135, 'staff competency': 132, 'shop organization': 99, 'service': 95, 'quality': 82, 'price': 53, 'environment': 38, 'staff availability': 31, 'misc': 27, 'delivery': 25, 'promotions': 15, 'tech support': 14, 'return warranty': 13, 'security': 2}
+Df name: Unique_roabsa_test.jpg
+Plot saved
+
+Show data origin distribution:
+[('manual', 556)]
+
+
+--------------------
+Show statistics for train dataset <<roabsa_eval.csv>>:
+
+Initial len: 557
+No duplicates len: 557
+Final len: 557
+
+Frequent unique categories:
+{'product': 167, 'staff competency': 154, 'shop diversity': 137, 'shop organization': 96, 'service': 91, 'quality': 71, 'price': 55, 'environment': 48, 'delivery': 28, 'misc': 24, 'staff availability': 18, 'tech support': 17, 'promotions': 10, 'security': 8, 'return warranty': 8}
+Df name: Unique_roabsa_eval.jpg
+Plot saved
+
+Show data origin distribution:
+[('manual', 557)]
