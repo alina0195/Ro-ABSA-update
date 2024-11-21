@@ -222,7 +222,7 @@ print('Nb of inconsistencies:', len(df_concat))
 df_concat.to_csv(Config.OUT_DIR + os.sep + Config.FILE_NAME_INCONSISTENCES, index=False)
 
 # Select only one annotator's values. Currently there are only 12 instances with different labels 
-df = df_22
+df = df[df['annotator']==22]
 df = add_specific_columns(df)
 df.drop_duplicates(subset=['text_cleaned','all_categories_old'], inplace=True)
 print('Df len with no duplicates:',len(df))
@@ -251,6 +251,7 @@ df_test, df_val = train_test_split(df, test_size=0.50, random_state=Config.SEED)
 print('Test dataset size:',len(df_test),'\nValidation dataset size:', len(df_val))
 print('-'*20)
 show_statistics(df_test, Config.FILE_NAME_TEST_CSV)
+print('-'*20)
 show_statistics(df_val, Config.FILE_NAME_EVAL_CSV)
 
 df_test.to_csv(Config.OUT_DIR + os.sep + Config.FILE_NAME_TEST_CSV, index=False)
