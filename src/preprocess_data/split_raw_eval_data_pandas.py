@@ -226,8 +226,6 @@ df = df[df['annotator']==22]
 df = add_specific_columns(df)
 df.drop_duplicates(subset=['text_cleaned','all_categories_old'], inplace=True)
 print('Df len with no duplicates:',len(df))
-# print(df.columns)
-# print(df.iloc[0])
 
 # Check for common values with training dataset
 print('-'*20)
