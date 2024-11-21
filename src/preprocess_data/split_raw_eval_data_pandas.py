@@ -178,13 +178,9 @@ def show_statistics(df: pd.DataFrame, filename:str, include_all_categories:bool=
     print('Initial len:', len(df))
     df.drop_duplicates(subset=['text_cleaned'], inplace=True)
     print('No duplicates len:', len(df))
+    df.dropna(subset=['all_categories','all_polarities','text_cleaned'],inplace=True)
 
-    if include_all_categories==False:
-        if 'all_categories_old' in df.columns:
-            df.drop(columns=['all_categories_old'], inplace=True)
-            df.dropna(inplace=True)
-            print('Final len:', len(df))
-    else:
+    if include_all_categories:
         all_cats_old=get_all_categories_in_list(df, 'all_categories_old')
         freq_lbls_all = Counter(all_cats_old).most_common(len(all_cats_old))
         freq_lbls_all = {item[0]:item[1] for item in freq_lbls_all}
