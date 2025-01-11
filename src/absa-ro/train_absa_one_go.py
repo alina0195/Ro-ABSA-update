@@ -11,20 +11,26 @@ import os
 import numpy as np
 import pandas as pd
 
+from sklearn.metrics import f1_score
+from accelerate import Accelerator
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
-from transformers import (AdamW, AutoTokenizer,AutoModelForSeq2SeqLM,
-                      T5ForConditionalGeneration, T5Tokenizer, 
-                      MT5ForConditionalGeneration,
-                      AutoConfig, AutoModelForCausalLM,
-                      get_linear_schedule_with_warmup)
-from transformers.optimization import Adafactor, AdafactorSchedule
-from sklearn.metrics import f1_score
-from transformers import GenerationConfig
-from accelerate import Accelerator
-from peft import (LoraConfig, get_peft_model, 
+from transformers import (AdamW, AutoTokenizer,
+                          AutoModelForSeq2SeqLM,
+                          GenerationConfig,
+                          T5ForConditionalGeneration, 
+                          T5Tokenizer, 
+                          MT5ForConditionalGeneration,
+                          AutoConfig, 
+                          AutoModelForCausalLM,
+                          get_linear_schedule_with_warmup)
+from transformers.optimization import (Adafactor, 
+                                       AdafactorSchedule)
+from peft import (LoraConfig, 
+                  get_peft_model, 
                   prepare_model_for_kbit_training, 
-                  TaskType, PeftModel)
+                  TaskType, 
+                  PeftModel)
 
 nltk.download('punkt')
 torch.set_warn_always(True)
@@ -40,35 +46,36 @@ def set_seed(seed):
 
 class config:
   SEED = 42
-  ROOT = os.getcwd()
-  DATASET_TRAIN = ROOT + os.sep +'data/df_train_absa.csv'
-  DATASET_TESTVAL = ROOT + os.sep +'data/df_testval.csv'
+  DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
   
-  MODEL_SAVE_PATH = ROOT + os.sep +'models/v1.pt'
-  MODEL_PRETRAINED_ATE ='bigscience/mt0-xl'
-  PRE_TRAINED_TOKENIZER_NAME ='bigscience/mt0-xl'
+  ROOT = os.getcwd()
+  DATASET_TRAIN = ROOT + os.sep +'data/new_data/absa/train_absaPairs.csv'
+  DATASET_TEST = ROOT + os.sep +'data/new_data/absa/test_absaPairs.csv'
+  DATASET_VAL = ROOT + os.sep +'data/new_data/absa/eval_absaPairs.csv'
+  
+  MODEL_SAVE_PATH = ROOT + os.sep +'models/new_models/absa_onego_mt0large_v1.pt'
+  MODEL_PRETRAINED_ATE ='bigscience/mt0-large'
+  PRE_TRAINED_TOKENIZER_NAME ='bigscience/mt0-large'
 
   MAX_SOURCE_LEN = 356
-  MAX_TARGET_LEN = 40
+  MAX_TARGET_LEN = 20
 
-  BATCH_SIZE_TRAIN_LBL = 4
-  BATCH_SIZE_TEST = 2
+  BATCH_SIZE = 2
 
-  EPOCHS = 5
+  EPOCHS = 10
   LR = [3e-5, 1e-4, 2e-4, 3e-4]
   LR_IDX = 1
   EPS = 1e-5
   USE_LORA = False
   USE_CONSTANT_SCHEDULER = False
-  DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
   lora_config = LoraConfig(
-                        r=16,
-                        lora_alpha=32,
-                        target_modules=["q", "v"],
-                        lora_dropout=0.05,
-                        bias="none",
-                        task_type=TaskType.SEQ_2_SEQ_LM,
-                        use_rslora=True
+                            r=16,
+                            lora_alpha=32,
+                            target_modules=["q", "v"],
+                            lora_dropout=0.05,
+                            bias="none",
+                            task_type=TaskType.SEQ_2_SEQ_LM,
+                            use_rslora=True
                         )
 
 
@@ -77,10 +84,17 @@ AIM: Train end to end ABSA-Ro
 """
 set_seed(config.SEED)
 df_train = pd.read_csv(config.DATASET_TRAIN)
-df_testval = pd.read_csv(config.DATASET_TESTVAL)
+df_test = pd.read_csv(config.DATASET_TEST)
+df_val = pd.read_csv(config.DATASET_VAL)
+
+print('DF TRAIN:', len(df_train))
+print('DF TEST:', len(df_test))
+print('DF VAL:', len(df_val))
+
 
 df_train.dropna(subset=['absa_input'],inplace=True)
-df_testval.dropna(subset=['absa_input'],inplace=True)
+df_test.dropna(subset=['absa_input'],inplace=True)
+df_val.dropna(subset=['absa_input'],inplace=True)
 
 punctuation = string.punctuation
 punctuation = re.sub('-','',punctuation)
@@ -92,6 +106,7 @@ def format_time(elapsed):
     '''
     elapsed_rounded = int(round((elapsed)))
     return str(datetime.timedelta(seconds=elapsed_rounded))
+
 
 def tokenize_function(text, tokenizer, max_len):
   encoded_dict = tokenizer.encode_plus(
@@ -123,21 +138,21 @@ class ABSADataset(torch.utils.data.Dataset):
             'target_attention_mask' : item['target_attention_mask'].clone().detach().squeeze()
         }
 
-def get_dataloader(df_train, df_test_val, text_col, target_col):
+def get_dataloader(df_train, df_test, df_val, text_col, target_col):
   df_train['source_inputs_ids'], df_train['source_attention_mask'] = zip(* df_train.apply(lambda x: tokenize_function(x[text_col],tokenizer,config.MAX_SOURCE_LEN), axis=1))
   df_train['target_inputs_ids'], df_train['target_attention_mask'] = zip(* df_train.apply(lambda x: tokenize_function(x[target_col],tokenizer,config.MAX_TARGET_LEN), axis=1))
-  df_test_val['source_inputs_ids'], df_test_val['source_attention_mask'] = zip(* df_test_val.apply(lambda x: tokenize_function(x[text_col],tokenizer,config.MAX_SOURCE_LEN), axis=1))
-  df_test_val['target_inputs_ids'], df_test_val['target_attention_mask'] = zip(* df_test_val.apply(lambda x: tokenize_function(x[target_col],tokenizer,config.MAX_TARGET_LEN), axis=1))
+  df_test['source_inputs_ids'], df_test['source_attention_mask'] = zip(* df_test.apply(lambda x: tokenize_function(x[text_col],tokenizer,config.MAX_SOURCE_LEN), axis=1))
+  df_test['target_inputs_ids'], df_test['target_attention_mask'] = zip(* df_test.apply(lambda x: tokenize_function(x[target_col],tokenizer,config.MAX_TARGET_LEN), axis=1))
+  df_val['source_inputs_ids'], df_val['source_attention_mask'] = zip(* df_val.apply(lambda x: tokenize_function(x[text_col],tokenizer,config.MAX_SOURCE_LEN), axis=1))
+  df_val['target_inputs_ids'], df_val['target_attention_mask'] = zip(* df_val.apply(lambda x: tokenize_function(x[target_col],tokenizer,config.MAX_TARGET_LEN), axis=1))
   
-  df_test, df_val = train_test_split(df_testval, test_size=0.50, random_state=config.SEED)
-
   train_dataset = ABSADataset(df_train)
   val_dataset = ABSADataset(df_val)
   test_dataset = ABSADataset(df_test)
 
-  train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE_TRAIN_LBL, shuffle=True)
-  val_dataloader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE_TEST, shuffle=False)
-  test_dataloader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE_TEST, shuffle=False)
+  train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+  val_dataloader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+  test_dataloader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
   
   print('Train data size:', len(df_train))
   print('Test data size:', len(df_test))
@@ -157,6 +172,7 @@ def load_model(base_name, accelerate):
 
 def initialize_parameters(model, train_dataloader, optimizer_name, idx_lr):
   total_steps = len(train_dataloader) * config.EPOCHS
+  
   if config.USE_CONSTANT_SCHEDULER==True:
     num_warmup_steps=0
   else:
@@ -236,19 +252,20 @@ def train_loop(lr_idx, model, tokenizer, train_dataloader, val_dataloader, optim
   best_model=None
   best_val_loss = float('+inf')
 
-  wandb.init(project="absa_ro", name="V12_mt0xl",
+  wandb.init(project="new_roabsa_onego", name="V1_mt0large",
              config={
                       "Description": "Train ABSA model with output pairs: <ATC1 is Pol1; ...;ATCn is PolN>",
                       "learning rate": config.LR[lr_idx],
                       "optimizer": "adam",
                       "constant scheduler": config.USE_CONSTANT_SCHEDULER,
                       "lora": config.USE_LORA,
-                      "batch_size": config.BATCH_SIZE_TRAIN_LBL,
+                      "batch_size": config.BATCH_SIZE,
                       "MAX_SOURCE_LEN": config.MAX_SOURCE_LEN,
                       "MAX_TARGET_LEN": config.MAX_TARGET_LEN,
                       "epochs": config.EPOCHS,
                       "dataset train": f"{config.DATASET_TRAIN}",
-                      "dataset test+val": f"{config.DATASET_TESTVAL}",
+                      "dataset test": f"{config.DATASET_TEST}",
+                      "dataset val": f"{config.DATASET_VAL}",
                       "pretrained model":config.MODEL_PRETRAINED_ATE,
                       "pretrained tokenizer":config.PRE_TRAINED_TOKENIZER_NAME,
                       "model save path": config.MODEL_SAVE_PATH,
@@ -265,7 +282,6 @@ def train_loop(lr_idx, model, tokenizer, train_dataloader, val_dataloader, optim
     wandb.log({"Train Loss":train_loss, "Val Loss": val_loss, 
                "Val F1": val_f1, "Scheduler":current_lr,
                "Val exact match": val_em})
-
     if val_loss < best_val_loss:
       print(f"New best validation loss:{val_loss}")
       best_val_loss = val_loss
@@ -357,6 +373,7 @@ def eval(model, tokenizer, dataloader, epoch, accelerate):
 
 tokenizer = AutoTokenizer.from_pretrained(config.PRE_TRAINED_TOKENIZER_NAME)
 model = load_model(base_name=config.MODEL_PRETRAINED_ATE, accelerate=False)
+
 if config.USE_LORA==True:
   model = prepare_model_for_kbit_training(model)
   model = get_peft_model(model, config.lora_config)
@@ -375,8 +392,7 @@ gen_config = GenerationConfig(
     no_repeat_ngram_size=4,
 )
 
-
-train_dataloader, val_dataloader, test_dataloader = get_dataloader(df_train, df_testval, 'absa_input', 'absa_target')
+train_dataloader, val_dataloader, test_dataloader = get_dataloader(df_train, df_test, df_val, 'absa_input', 'absa_target')
 
 optimizer, scheduler, autoconfig = initialize_parameters(model, train_dataloader, 'adam', config.LR_IDX)
 
