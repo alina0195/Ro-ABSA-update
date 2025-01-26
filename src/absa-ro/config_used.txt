@@ -1,0 +1,17 @@
+MODEL_PRETRAINED            ModelSaved                        MAX_SRC_LEN       MAX_TGT_LEN       BATCH_SIZE       Gradient Acc       EPOCHS       LR      scheduler       Result         File                            Gen[Temp]       Gen[Beams]      Gen[no_ngram]       Gen[do sample]   LORA
+
+google/flan-t5-large     absa_onego_flanLarge_v1                   512                 40                2               No                10         2e-4     constant       .....     train_Absa_one_go.py                     0.2               5               4                   true    false
+(command: sbatch -p dgxa100 -A phd --gres gpu:4 --time=1-0 --cpus-per-task=2 --mem-per-cpu=16G ./apptainer-exec.sh train_absa_one_go.py)
+
+google/flan-t5-xl        absa_onego_flanXL_v1                      512                 40                2               No                10         2e-4     constant       .....     train_Absa_one_go2.py                    0.2               5               4                   true     false
+(command: sbatch -p dgxa100 -A phd --gres gpu:2 --time=1-0 --cpus-per-task=2 --mem-per-cpu=40G ./apptainer-exec-no-acc.sh train_absa_one_go2.py)
+
+
+google/flan-t5-xxl        absa_onego_flanXXL_v1                    512                 40                2               No                5         2e-4     constant       .....     train_Absa_one_go.py                      0.2               5               4                   true     true
+(command: sbatch -p dgxa100 -A phd --gres gpu:2 --time=1-0 --cpus-per-task=2 --mem-per-cpu=50G ./apptainer-exec-no-acc.sh train_absa_one_go.py)
+
+google/flan-t5-xl          absa_onego_flanXL_v2                   512                 40                2               Yes                5         2e-4     constant       .....     train_Absa_one_go2.py                      0.2               5               4                   true     false
+(command: sbatch -p dgxa100 -A phd --gres gpu:2 --time=1-0 --cpus-per-task=2 --mem-per-cpu=40G ./apptainer-exec-no-acc.sh train_absa_one_go2.py)
+
+
+

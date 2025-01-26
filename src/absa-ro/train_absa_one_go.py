@@ -26,6 +26,7 @@ from transformers import (AdamW, AutoTokenizer,
                           get_linear_schedule_with_warmup)
 from transformers.optimization import (Adafactor, 
                                        AdafactorSchedule)
+from torch.nn import CrossEntropyLoss
 from peft import (LoraConfig, 
                   get_peft_model, 
                   prepare_model_for_kbit_training, 
@@ -53,21 +54,29 @@ class config:
   DATASET_TEST = ROOT + os.sep +'data/new_data/absa/test_absaPairs.csv'
   DATASET_VAL = ROOT + os.sep +'data/new_data/absa/eval_absaPairs.csv'
   
-  MODEL_SAVE_PATH = ROOT + os.sep +'models/new_models/absa_onego_mt0large_v1.pt'
-  MODEL_PRETRAINED_ATE ='bigscience/mt0-large'
+  MODEL_SAVE_PATH = ROOT + os.sep +'models/new_models/absa_onego_mt0large_v4.pt' 
+  MODEL_PRETRAINED_ATE ='bigscience/mt0-large' 
   PRE_TRAINED_TOKENIZER_NAME ='bigscience/mt0-large'
+  WANDB_INIT_NAME = "mt0-large-v4"
+  
+  MAX_SOURCE_LEN = 512
+  MAX_TARGET_LEN = 40
 
-  MAX_SOURCE_LEN = 356
-  MAX_TARGET_LEN = 20
+  BATCH_SIZE = 8
 
-  BATCH_SIZE = 2
-
-  EPOCHS = 10
+  EPOCHS = 5
   LR = [3e-5, 1e-4, 2e-4, 3e-4]
   LR_IDX = 1
   EPS = 1e-5
+  
+  gradient_accumulation_steps = 4
+  label_smoothing = 0.1 # 0.0 if we do not use label smoothing for lowering the prediction confidence. Reduces overfitting in smaller datasets.
+  
+  USE_LABEL_SMOOTHING = True
+  USE_GRADIENT_ACC = False
   USE_LORA = False
-  USE_CONSTANT_SCHEDULER = False
+  USE_CONSTANT_SCHEDULER = True
+  
   lora_config = LoraConfig(
                             r=16,
                             lora_alpha=32,
@@ -141,8 +150,10 @@ class ABSADataset(torch.utils.data.Dataset):
 def get_dataloader(df_train, df_test, df_val, text_col, target_col):
   df_train['source_inputs_ids'], df_train['source_attention_mask'] = zip(* df_train.apply(lambda x: tokenize_function(x[text_col],tokenizer,config.MAX_SOURCE_LEN), axis=1))
   df_train['target_inputs_ids'], df_train['target_attention_mask'] = zip(* df_train.apply(lambda x: tokenize_function(x[target_col],tokenizer,config.MAX_TARGET_LEN), axis=1))
+  
   df_test['source_inputs_ids'], df_test['source_attention_mask'] = zip(* df_test.apply(lambda x: tokenize_function(x[text_col],tokenizer,config.MAX_SOURCE_LEN), axis=1))
   df_test['target_inputs_ids'], df_test['target_attention_mask'] = zip(* df_test.apply(lambda x: tokenize_function(x[target_col],tokenizer,config.MAX_TARGET_LEN), axis=1))
+ 
   df_val['source_inputs_ids'], df_val['source_attention_mask'] = zip(* df_val.apply(lambda x: tokenize_function(x[text_col],tokenizer,config.MAX_SOURCE_LEN), axis=1))
   df_val['target_inputs_ids'], df_val['target_attention_mask'] = zip(* df_val.apply(lambda x: tokenize_function(x[target_col],tokenizer,config.MAX_TARGET_LEN), axis=1))
   
@@ -159,7 +170,6 @@ def get_dataloader(df_train, df_test, df_val, text_col, target_col):
   print('Val data size:', len(df_val))
 
   return train_dataloader, val_dataloader, test_dataloader
-
 
 def load_model(base_name, accelerate):
     if 'mt5' in base_name:
@@ -189,12 +199,15 @@ def initialize_parameters(model, train_dataloader, optimizer_name, idx_lr):
   autoconfig = AutoConfig.from_pretrained(config.MODEL_PRETRAINED_ATE)
   return optimizer, scheduler, autoconfig
 
-def train_one_epoch(model, dataloader, optimizer, epoch, accelerate):
+def train_one_epoch(model, dataloader, optimizer, epoch, accelerate, loss_fn):
+
     total_t0 = time.time()
     print('======== Epoch {:} / {:} ========'.format(epoch + 1, config.EPOCHS))
     print('Training...')
 
     train_losses = []
+    if config.USE_GRADIENT_ACC:
+        accumulated_loss = 0.0
     model.train()
 
     for step, batch in enumerate(dataloader):
@@ -206,53 +219,95 @@ def train_one_epoch(model, dataloader, optimizer, epoch, accelerate):
         target_input_ids = batch['target_inputs_ids']
         target_attention_mask = batch['target_attention_mask']
         
-        optimizer.zero_grad()
-        
         if accelerate==False:
-            source_input_ids = source_input_ids.to(config.DEVICE)
+            source_input_ids= source_input_ids.to(config.DEVICE)
             source_attention_mask = source_attention_mask.to(config.DEVICE)
             target_input_ids = target_input_ids.to(config.DEVICE)
             target_attention_mask = target_attention_mask.to(config.DEVICE)
             
             outputs = model(input_ids=source_input_ids,
-                        attention_mask=source_attention_mask,
-                        labels=target_input_ids, 
-                        decoder_attention_mask=target_attention_mask)
+                            attention_mask=source_attention_mask,
+                            labels=target_input_ids, 
+                            decoder_attention_mask=target_attention_mask)
+            del source_input_ids, source_attention_mask, target_attention_mask
         else:
             print('no valid option for accelerate')
 
-        loss, _ = outputs[:2]
+        if config.USE_LABEL_SMOOTHING:
+            logits = outputs.logits
+            shifted_logits = logits[...,:-1,:].contiguous()
+            shifted_labels = target_input_ids[...,1:].contiguous()
+            # logits shape: (batch size, sequence len, vocab size)
+            # Each element in logits represents the unnormalized probabilities (logits) for the vocabulary at a particular token position in the sequence.
+            # ...: This selects all dimensions before the sequence dimension (in this case, batch_size).
+            # :-1: This slices the sequence_length dimension, excluding the last token.  the last prediction doesn’t have a corresponding target label
+            # :  : This selects all the vocabulary logits for each token.
+            # The .contiguous() function ensures that the tensor is stored in a contiguous memory block. This is important because slicing operations in PyTorch can create non-contiguous tensors, which may cause issues during subsequent operations like .view() or .reshape()
+            loss = loss_fn(
+                            shifted_logits.view(-1, shifted_logits.size(-1)),
+                            shifted_labels.view(-1)
+            )
+            # .view() does not create a new copy of the tensor's data in memory. Instead, it returns a new tensor that shares the same underlying data as the original tensor. This makes it an efficient operation.
+            # Using -1 to Infer a Dimension
+        else:
+            loss, _ = outputs[:2]
+        
+        if config.USE_GRADIENT_ACC:
+            # Normalize loss by gradient_accumulation_steps
+            loss = loss / config.gradient_accumulation_steps
+            accumulated_loss += loss.item()
+            
         loss_item = loss.item()
         print('Batch loss:', loss_item)
         train_losses.append(loss_item)
-
+        
+        
         if accelerate==False:
             loss.backward()
         else:
             print('no valid option for accelerate')
-
-        optimizer.step()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        if config.USE_CONSTANT_SCHEDULER==False:
-          scheduler.step()
-          current_lr = scheduler.get_last_lr()[0]
-        current_lr = optimizer.param_groups[-1]['lr']
-
+            
+        if config.USE_GRADIENT_ACC:
+            # Update weights and optimizer after accumulating gradients
+            if (step + 1) % config.gradient_accumulation_steps == 0 or (step + 1) == len(dataloader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                if config.USE_CONSTANT_SCHEDULER==False:
+                    scheduler.step()
+                    current_lr = scheduler.get_last_lr()[0]
+                else:
+                    current_lr = optimizer.param_groups[-1]['lr']
+                print(f"Step {step + 1}, accumulated loss: {accumulated_loss:.5f}, learning rate: {current_lr:.6f}")
+                accumulated_loss = 0.0  # Reset accumulated loss
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            if config.USE_CONSTANT_SCHEDULER==False:
+                scheduler.step()
+                current_lr = scheduler.get_last_lr()[0]
+            else:
+                current_lr = optimizer.param_groups[-1]['lr']       
+                
     avg_train_loss = np.mean(train_losses)
     training_time = format_time(time.time() - total_t0)
 
     print("summary results")
     print("epoch | train loss | train time ")
     print(f"{epoch+1:5d} |   {avg_train_loss:.5f}  |   {training_time:}")
-    return avg_train_loss, current_lr, model
+    return avg_train_loss, current_lr, model, loss_fn
 
 
 def train_loop(lr_idx, model, tokenizer, train_dataloader, val_dataloader, optimizer, accelerate, gen_config):
 
   best_model=None
   best_val_loss = float('+inf')
-
-  wandb.init(project="new_roabsa_onego", name="V1_mt0large",
+  
+  if config.USE_LABEL_SMOOTHING:
+    loss_fn = CrossEntropyLoss(label_smoothing=config.label_smoothing)
+  else:
+    loss_fn = None
+      
+  wandb.init(project="new_roabsa_onego", name=config.WANDB_INIT_NAME,
              config={
                       "Description": "Train ABSA model with output pairs: <ATC1 is Pol1; ...;ATCn is PolN>",
                       "learning rate": config.LR[lr_idx],
@@ -277,7 +332,7 @@ def train_loop(lr_idx, model, tokenizer, train_dataloader, val_dataloader, optim
                     })
 
   for epoch in range(config.EPOCHS):
-    train_loss, current_lr, model = train_one_epoch(model, train_dataloader, optimizer, epoch, accelerate)
+    train_loss, current_lr, model, loss_fn = train_one_epoch(model, train_dataloader, optimizer, epoch, accelerate, loss_fn)
     val_loss, val_em, val_f1  = eval(model, tokenizer, val_dataloader, epoch, accelerate)
     wandb.log({"Train Loss":train_loss, "Val Loss": val_loss, 
                "Val F1": val_f1, "Scheduler":current_lr,
@@ -342,6 +397,8 @@ def eval(model, tokenizer, dataloader, epoch, accelerate):
                 print('No valid option for accelerate')
                 
             loss, _ = outputs[:2]
+            if config.USE_GRADIENT_ACC:
+                loss = loss / config.gradient_accumulation_steps
             valid_losses.append(loss.item())
 
             preds = [tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True) for g in generated_ids[0]]
