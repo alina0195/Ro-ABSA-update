@@ -20,13 +20,13 @@ from transformers import (BitsAndBytesConfig,
                           TrainingArguments,
                           )
 from peft import (LoraConfig, 
-                  TaskType 
-                )
-from torch.utils.data import TensorDataset
+                  TaskType, 
+                  PeftModel)           
+
+from transformers import EarlyStoppingCallback
 
 from peft import LoraConfig
 from trl import DataCollatorForCompletionOnlyLM, SFTTrainer
-from transformers import DataCollatorWithPadding
 from huggingface_hub import login
 login(token="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")
 
@@ -52,28 +52,27 @@ class config:
   DATASET_TEST = ROOT + os.sep +'data/new_data/atc/roabsa_test.csv'
   DATASET_VAL = ROOT + os.sep +'data/new_data/atc/roabsa_eval.csv'
   
-  MODEL_SAVE_PATH = ROOT + os.sep +'models/new_models/atc_rollama_v1.pt' 
-  MODEL_PRETRAINED_ATE ='OpenLLM-Ro/RoLlama3.1-8b-Instruct-DPO' 
-  PRE_TRAINED_TOKENIZER_NAME ='OpenLLM-Ro/RoLlama3.1-8b-Instruct-DPO'
-  WANDB_INIT_NAME = "RoLlama-3.1-8B-Instruct-DPO"
+  MODEL_SAVE_PATH = ROOT + os.sep +'models/new_models/atc_rollama3.1-8b-instruct_noBnBcConfig_v3.pt' 
+  MODEL_PRETRAINED_ATE ='OpenLLM-Ro/RoLlama3.1-8b-Instruct' 
+  PRE_TRAINED_TOKENIZER_NAME ='OpenLLM-Ro/RoLlama3.1-8b-Instruct'
+  WANDB_INIT_NAME = "OpenLLM-Ro/RoLlama3.1-8b-Instruct-test"
   
   MAX_SOURCE_LEN = 512
   MAX_TARGET_LEN = 32
   
-  BATCH_SIZE = 4
+  BATCH_SIZE = 2
   EPOCHS = 6
   LR = [3e-5, 1e-4, 2e-4, 3e-4]
   LR_IDX = 0
   EPS = 1e-5
   
-  gradient_accumulation_steps = 2
+  gradient_accumulation_steps = 8
   label_smoothing = 0.1 # 0.0 if we do not use label smoothing for lowering the prediction confidence.
   
   USE_LABEL_SMOOTHING = False
   USE_GRADIENT_ACC = False
   USE_LORA = True
-  USE_CONSTANT_SCHEDULER = True
-
+  USE_CONSTANT_SCHEDULER = False
 
 use_cpu = False
 resized_embeddings = False
@@ -92,15 +91,17 @@ gen_config = GenerationConfig(
     max_new_tokens = config.MAX_TARGET_LEN,
     return_dict_in_generate=True,
     output_scores=True,
-    do_sample=True,
-    temperature=0.1,
-    top_k=50,
-    top_p=0.9,
+    do_sample=False,
+    num_beams=30,
+    length_penalty=0,
+    # do_sample=True,
+    # temperature=0.1,
+    # top_k=50,
+    # top_p=0.9,
     repetition_penalty=1.2,
     num_return_sequences=1,
-    no_repeat_ngram_size=3,
+    no_repeat_ngram_size=5,
 )
-
 
 wandb.init(project="new_roabsa_atc", name=config.WANDB_INIT_NAME,
             config={
@@ -124,9 +125,11 @@ wandb.init(project="new_roabsa_atc", name=config.WANDB_INIT_NAME,
                     "model save path": config.MODEL_SAVE_PATH,
                     "Accelerate used": "False",
                     "Generate do_sample": gen_config.do_sample,
-                    "Generate temperature": gen_config.temperature,
-                    "Generate top_p": gen_config.top_p,
-                    "Generate top_k": gen_config.top_k,
+                    # "Generate temperature": gen_config.temperature,
+                    # "Generate top_p": gen_config.top_p,
+                    # "Generate top_k": gen_config.top_k,
+                    "Generate beams": gen_config.num_beams,
+                    "Generate length penalty": gen_config.length_penalty,
                     "Generate repetition_penalty": gen_config.repetition_penalty,
                     "Generate no_repeat_ngram_size": gen_config.no_repeat_ngram_size,
                 })
@@ -135,6 +138,10 @@ set_seed(config.SEED)
 df_train = pd.read_csv(config.DATASET_TRAIN)
 df_test = pd.read_csv(config.DATASET_TEST)
 df_val = pd.read_csv(config.DATASET_VAL)
+
+# df_train=df_train[:500]
+# df_val=df_val[:100]
+# df_test=df_test[:10]
 
 print('DF TRAIN:', len(df_train))
 print('DF TEST:', len(df_test))
@@ -146,6 +153,28 @@ df_val.dropna(subset=['text_cleaned'],inplace=True)
 
 punctuation = string.punctuation
 punctuation = re.sub('-','',punctuation)
+
+
+# def get_batch_logps(
+#     logits: "torch.Tensor", labels: "torch.Tensor", label_pad_token_id: int = IGNORE_INDEX
+# ) -> Tuple["torch.Tensor", "torch.Tensor"]:
+#     r"""
+#     Computes the log probabilities of the given labels under the given logits.
+
+#     Returns:
+#         logps: A tensor of shape (batch_size,) containing the sum of log probabilities.
+#         valid_length: A tensor of shape (batch_size,) containing the number of non-masked tokens.
+#     """
+#     if logits.shape[:-1] != labels.shape:
+#         raise ValueError("Logits (batchsize x seqlen) and labels must have the same shape.")
+
+#     labels = labels[:, 1:].clone()
+#     logits = logits[:, :-1, :]
+#     loss_mask = labels != label_pad_token_id
+#     labels[labels == label_pad_token_id] = 0  # dummy token
+#     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+#     return (per_token_logps * loss_mask).sum(-1), loss_mask.sum(-1)
+
 
 def f1(pred, target):
       return f1_score(target, pred, average='weighted')
@@ -165,6 +194,30 @@ def recall(pred, target):
             already_seen.append(p)
     sum=sum/(len(target))
     return sum
+
+
+def precision(pred, target):
+    pred = pred.split(';')
+    target = target.split(';')
+    
+    pred = [p.strip() for p in pred]
+    target = [p.strip() for p in target]
+
+    correct = 0
+    already_seen = []
+    for p in pred:
+        if p in target and p not in already_seen:
+            correct += 1
+            already_seen.append(p)
+    
+    return correct / len(pred) if len(pred) > 0 else 0
+
+
+def label_f1(precision, recall):
+    if precision + recall == 0:
+        return 0  
+    return 2 * (precision * recall) / (precision + recall)
+
 
 def format_time(elapsed):
     '''
@@ -205,13 +258,14 @@ def load_model_and_tokenizer(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        quantization_config=bnb_config,
+        # quantization_config=bnb_config,
         token=token,
         low_cpu_mem_usage=True if not use_cpu else False,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_path,
                                               use_fast=False,
+                                              padding_side="left", #added
                                               token=token)
 
     return model, tokenizer
@@ -222,11 +276,44 @@ model, tokenizer = load_model_and_tokenizer(
                                             token='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',
                                             use_cpu= False)
 
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = "[PAD]"
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    model.resize_token_embeddings(len(tokenizer))
-    resized_embeddings = True
+tokenizer.pad_token_id = 128002
+model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+print("PAD Token:", tokenizer.pad_token)
+print("PAD Token ID:", tokenizer.pad_token_id)
+print("EOS Token:", tokenizer.eos_token)
+print("EOS Token ID:", tokenizer.eos_token_id)
+print("Padding Side:", tokenizer.padding_side)
+
+def test_tokenizer():
+    # Get the vocabulary size
+    vocab_size = tokenizer.vocab_size
+
+    # Find an unused token ID
+    unused_token_id = vocab_size  # Typically, the next available ID is safe
+
+    print("Vocab Size:", vocab_size)
+    print("Unused Token ID:", unused_token_id)
+    
+    test_texts = [
+    "The laptop's battery lasts very long, but the screen is dim.",
+    "I love the fast delivery!",
+    "The food was terrible, but the service was excellent."
+    ]
+
+    # Tokenize with padding enabled
+    tokenized = tokenizer(
+        test_texts, 
+        padding=True,  # Pad to longest sequence
+        truncation=True, 
+        return_tensors="pt"
+    )
+
+    print("Tokenized Input IDs:", tokenized["input_ids"])
+    print("Decoded Texts:", tokenizer.batch_decode(tokenized["input_ids"]))
+    print("Attention Mask:", tokenized["attention_mask"])
+
+test_tokenizer()
 
 lora_config = LoraConfig(
                         r=64,
@@ -239,10 +326,13 @@ lora_config = LoraConfig(
                         use_rslora=True,
                     )
 
+
 collator = DataCollatorForCompletionOnlyLM(
                                     tokenizer=tokenizer,
-                                    response_template="assistant",
-                                )
+                                    mlm=False,
+                                    return_tensors="pt",
+                                    response_template="<|start_header_id|>assistant<|end_header_id|>",
+                                ) # automatically pads sequences inside a batch to the longest one.
 
 train_dataset = Dataset.from_pandas(df_train)
 val_dataset = Dataset.from_pandas(df_val)
@@ -250,29 +340,31 @@ val_dataset = Dataset.from_pandas(df_val)
 
 def format_as_chat_with_output(example):
     messages =  [  
+            {"role": "system", "content": "You are an expert linguist specialized in extracting categories of aspect terms identified in reviews."},
             {"role": "user", "content": example["text_cleaned"]},  # User input
             {"role": "assistant", "content": example["all_categories_old"]},  # Model response
         ]
-    if hasattr(tokenizer, "apply_chat_template"):
-        formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    else:
-        formatted_text = f"User: {example['text_cleaned']}\n###assitant: {example['all_categories_old']}"
-
+    formatted_text = tokenizer.apply_chat_template(messages, 
+                                                    tokenize=False, 
+                                                    # max_length=config.MAX_SOURCE_LEN,
+                                                    add_special_tokens=False,
+                                                    add_generation_prompt=False)
+    
     return formatted_text
 
-def format_as_chat_without_output(text_cleaned, add_system_msg=False):
+def format_as_chat_without_output(text_cleaned, add_system_msg=True):
     if add_system_msg:
         system_message = {
             "role": "system",
-            "content": (
-                "You are an assistant specialized in extracting aspects from reviews. "
-                """Given a user's review, list all aspects categories that have corresponding opinions.
-                Review: <<I love how organized the store is, but the delivery was late.>>
-                Aspects: store organization; delivery"""
-            )
+            "content": "You are an expert linguist specialized in extracting categories of aspect terms identified in reviews."
+            # "content": (
+            #     "You are an expert linguist specialized in extracting categories of aspect terms identified in reviews."
+            #     """Given a user's review, list all aspects categories that have corresponding opinions.
+            #     Review: <<I love how organized the store is, but the delivery was late.>>
+            #     Aspects: store organization; delivery"""
+            # )
         }
-        messages =  [ system_message, {"role": "user", "content": text_cleaned}] 
-    
+        messages =  [system_message, {"role": "user", "content": text_cleaned}] 
     else:
         messages =  [ {"role": "user", "content": text_cleaned}] 
         
@@ -287,7 +379,7 @@ def format_as_chat_without_output(text_cleaned, add_system_msg=False):
                 )
         else:
             formatted_text = f"User: {text_cleaned}\n###assitant: "
-        
+    
     return formatted_text
 
 class TestDataset(torch.utils.data.Dataset):
@@ -302,19 +394,20 @@ class TestDataset(torch.utils.data.Dataset):
         return {
             'all_categories_old': item['all_categories_old'],
             'input_ids' : item['input_ids'],
-            'attention_mask' : item['attention_mask']
+            'attention_mask' : item['attention_mask'],
         }
         
 def tokenize_test_example(example):
     tokenized = tokenizer(example, 
                           padding=False,  # We'll pad later in collate_fn
+                          return_tensors="pt",
                           truncation=True)
     return tokenized['input_ids'], tokenized['attention_mask']
 
 def collate_test_fn(batch):
-    # `batch` is a list of dictionaries returned by `__getitem__`
-    input_ids = [torch.tensor(ex["input_ids"], dtype=torch.long) for ex in batch]
-    attention_masks = [torch.tensor(ex["attention_mask"], dtype=torch.long) for ex in batch]
+    # `batch` is a list of dictionaries returned by `__getitem__` from dataset
+    input_ids = [ex["input_ids"] for ex in batch]
+    attention_masks = [ex["attention_mask"] for ex in batch]
     refs = [ex["all_categories_old"] for ex in batch]
 
     padded = tokenizer.pad(
@@ -332,10 +425,15 @@ def collate_test_fn(batch):
 def evaluate_model(df_test, model, tokenizer):
   bleu_metric = evaluate.load("bleu")
   rouge_metric = evaluate.load("rouge")
-  tokenizer.padding_side = "left"
   
-  df_test['text_formatted'] = df_test['text_cleaned'].apply(lambda x: format_as_chat_without_output(x))
-  df_test['input_ids'], df_test['attention_mask'] = zip(*df_test['text_formatted'].apply(lambda x: tokenize_test_example(x)))
+  df_test['text_formatted'] = df_test['text_cleaned'].apply(format_as_chat_without_output)
+  tokenized_outputs = tokenizer(df_test["text_formatted"].tolist(),
+                                padding=True,  # Ensure batch-level padding
+                                truncation=True,
+                                return_tensors="pt")
+  df_test["input_ids"] = tokenized_outputs["input_ids"].tolist()
+  df_test["attention_mask"] = tokenized_outputs["attention_mask"].tolist()
+  
   test_dataloader = DataLoader(TestDataset(df_test), 
                              batch_size=config.BATCH_SIZE,
                              collate_fn=collate_test_fn)
@@ -345,7 +443,10 @@ def evaluate_model(df_test, model, tokenizer):
 
   preds = []
   refs = []
+  
   recalls = []
+  precisions = []
+  f1_instance_level = []
   
   for batch in test_dataloader: 
     input_ids = batch['input_ids'].to(model.device)
@@ -354,23 +455,26 @@ def evaluate_model(df_test, model, tokenizer):
     
     with torch.no_grad():
       outputs = model.generate(input_ids=input_ids,
-                               attention_mask=attention_mask,
+                               attention_mask= attention_mask,
                                 max_new_tokens = config.MAX_TARGET_LEN,
                                 return_dict_in_generate=True,
                                 output_scores=True,
-                                do_sample=True,
-                                temperature=0.1,
-                                top_k=50,
-                                top_p=0.9,
+                                num_beams=30,
+                                length_penalty=0,
                                 repetition_penalty=1.2,
                                 num_return_sequences=1,
-                                no_repeat_ngram_size=3,
+                                no_repeat_ngram_size=5,
+                                pad_token_id = tokenizer.pad_token_id
                                ) # GenerateBeamDecoderOnlyOutput
+      
+    # do_sample=True,
+    # temperature=0.1,
+    # top_k=50,
+    # top_p=0.9,
     # contains:
     #   outputs.sequences        -> the generated token IDs
     #   outputs.sequences_scores -> log probability scores for each sequence
     #   outputs.scores           -> a list of token-level logit distributions
-    print('New texts generated.')
     predictions = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
     # log_probs = outputs.sequences_scores  # shape: [batch_size * num_return_sequences]. Values are in log space. Higher value is better
     # try:
@@ -388,12 +492,17 @@ def evaluate_model(df_test, model, tokenizer):
     
     preds.extend(cleaned_outputs)
     refs.extend(references)
+    
+    print("\nPrediction:", cleaned_outputs)
+    print("Reference:", references)
+    
     for pred, ref in zip(cleaned_outputs, references):
-        print('Reference:', ref)
-        print('Prediction:', pred)
         current_recall = recall(pred=pred, target=ref)
-        print('Current Recall:',current_recall)
+        current_precision = precision(pred=pred, target=ref)
         recalls.append(current_recall)
+        precisions.append(current_precision)
+        f1_instance_level.append(label_f1(precision=current_precision, recall=current_recall))
+        
   
   result_rouge = rouge_metric.compute(predictions=preds, 
                                       references=refs)
@@ -401,14 +510,16 @@ def evaluate_model(df_test, model, tokenizer):
                                     references=[[ref] for ref in refs])
   result_f1 = f1_score(refs, preds, average='weighted')
   result_recall = np.mean(recalls)
-
-  print("Prediction:", preds)
-  print("Reference:", refs)
-  print("ROUGE:", result_rouge)
+  result_precision = np.mean(precisions)
+  result_f1_instance_level = np.mean(f1_instance_level)
+  
+  print("\nROUGE:", result_rouge)
   print("BLEU:", result_bleu['bleu'])
   print("BLEU precisions:", result_bleu['precisions'])
   print("F1:", result_f1)
   print("Recall:", result_recall)
+  print("Precision:", result_precision)
+  print("Result F1 instance level:", result_f1_instance_level)
   
   wandb.log({
       'Test Rouge R1':result_rouge['rouge1'],
@@ -417,12 +528,22 @@ def evaluate_model(df_test, model, tokenizer):
       'Test Bleu':result_bleu['bleu'],
       'Test Bleu precisions':np.mean(result_bleu['precisions']), 
       'Test F1':result_f1,
-      'Test Recall':result_recall
+      'Test Recall':result_recall,
+      'Test Precision': result_precision,
+      'Test F1 instance level': result_f1_instance_level
   })
 
+
+early_stopping = EarlyStoppingCallback(
+    early_stopping_patience=3,  # Stop training if no improvement after 3 evals
+    early_stopping_threshold=0.01  # Require at least 0.01 improvement in eval_loss
+)
+
+
 training_args = TrainingArguments(
-        output_dir="logs",
+        output_dir=f"logs_{config.WANDB_INIT_NAME}",
         per_device_train_batch_size=config.BATCH_SIZE,
+        per_device_eval_batch_size=config.BATCH_SIZE,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.LR[config.LR_IDX],
         logging_steps=10,
@@ -430,9 +551,10 @@ training_args = TrainingArguments(
         optim="adamw_8bit",
         report_to="wandb",
         run_name=config.WANDB_INIT_NAME,
-        lr_scheduler_type="constant",
-        max_grad_norm=0.3,
-        warmup_ratio=0.03,
+        lr_scheduler_type="cosine",
+        weight_decay=0.01,
+        max_grad_norm=1,
+        warmup_ratio=0.1,
         bf16=False,
         tf32=True if not use_cpu else False,
         save_strategy="epoch",
@@ -447,8 +569,7 @@ training_args = TrainingArguments(
         disable_tqdm=False,
         group_by_length=False,
         dataloader_drop_last=False,
-        dataloader_num_workers=4,
-        eval_on_start=True,
+        dataloader_num_workers=128,
         # use_liger_kernel=True #check
     )
 
@@ -462,15 +583,27 @@ try:
                             tokenizer=tokenizer,
                             args=training_args,
                             data_collator=collator,
-                            formatting_func=format_as_chat_with_output,
+                            formatting_func=format_as_chat_with_output,  
+                            callbacks=[early_stopping]
                         )
 
-    print('Start training...')
-    trainer.train()
-    print('Training finished')
-    trainer.save_model(config.MODEL_SAVE_PATH)
-    print('Model saved')
+    # print('Start training...')
+    # trainer.train()
+    # print('Training finished')
+    # trainer.save_model(config.MODEL_SAVE_PATH)
+    # print(f'Model saved to: {config.MODEL_SAVE_PATH}')
 
+    # if training_args.load_best_model_at_end:
+    #     best_model_path = trainer.state.best_model_checkpoint  
+    #     print(f"Loading the best model from checkpoint... {best_model_path}")
+    #     if best_model_path is not None:
+    #         trainer.model = trainer.model.from_pretrained(best_model_path)  
+    # else:
+    #     print("Warning: No best model checkpoint found. Using the last trained model.")
+    
+    base_model = model.from_pretrained(config.MODEL_SAVE_PATH)
+    trainer.model = PeftModel.from_pretrained(base_model, '/export/home/acs/stud/a/alina.gheorghe2505/ssl/logs_OpenLLM-Ro/RoLlama3.1-8b-Instruct/checkpoint-966')   
+     
     print('Testing the model...')
     evaluate_model(df_test=df_test,
                    model=trainer.model,
