@@ -1,0 +1,466 @@
+import re
+import datetime
+import string
+import wandb
+import torch
+import string
+import evaluate
+import random
+import nltk
+import os
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import f1_score
+from datasets import Dataset
+from torch.utils.data import DataLoader
+from transformers import PreTrainedTokenizerBase, GenerationConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import (BitsAndBytesConfig, 
+                          TrainingArguments,
+                          )
+from peft import (LoraConfig, 
+                  TaskType 
+                )
+from torch.utils.data import TensorDataset
+
+from peft import LoraConfig
+from trl import DataCollatorForCompletionOnlyLM, SFTTrainer
+from transformers import DataCollatorWithPadding
+from huggingface_hub import login
+login(token="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")
+
+nltk.download('punkt')
+torch.set_warn_always(True)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+class config:
+  SEED = 42
+  DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+  
+  ROOT = os.getcwd()
+  DATASET_TRAIN = ROOT + os.sep +'data/new_data/atc/roabsa_train.csv'
+  DATASET_TEST = ROOT + os.sep +'data/new_data/atc/roabsa_test.csv'
+  DATASET_VAL = ROOT + os.sep +'data/new_data/atc/roabsa_eval.csv'
+  
+  MODEL_SAVE_PATH = ROOT + os.sep +'models/new_models/atc_llama_v2.pt' 
+  MODEL_PRETRAINED_ATE ='meta-llama/Llama-3.1-8B-Instruct' 
+  PRE_TRAINED_TOKENIZER_NAME ='meta-llama/Llama-3.1-8B-Instruct'
+  WANDB_INIT_NAME = "llama-3.1-8B-Instruct"
+  
+  MAX_SOURCE_LEN = 512
+  MAX_TARGET_LEN = 512
+  
+  BATCH_SIZE = 4
+  EPOCHS = 10
+  LR = [3e-5, 1e-4, 2e-4, 3e-4]
+  LR_IDX = 0
+  EPS = 1e-5
+  
+  gradient_accumulation_steps = 2
+  label_smoothing = 0.1 # 0.0 if we do not use label smoothing for lowering the prediction confidence.
+  
+  USE_LABEL_SMOOTHING = False
+  USE_GRADIENT_ACC = False
+  USE_LORA = True
+  USE_CONSTANT_SCHEDULER = True
+
+
+use_cpu = False
+resized_embeddings = False
+gen_config = GenerationConfig(
+    max_new_tokens = config.MAX_TARGET_LEN,
+    return_dict_in_generate=True,
+    output_scores=True,
+    do_sample=False,
+    num_beams=1,
+    temperature=0,
+    num_return_sequences=1,
+    no_repeat_ngram_size=4,
+)
+
+
+wandb.init(project="new_roabsa_atc", name=config.WANDB_INIT_NAME,
+            config={
+                    "Target": "all categories",
+                    "Description": "Train ATC model with output pairs: <ATC1 is Pol1; ...;ATCn is PolN>",
+                    "learning rate": config.LR[config.LR_IDX],
+                    "optimizer": "adam",
+                    "use label smoothing": config.USE_LABEL_SMOOTHING,
+                    "constant scheduler": config.USE_CONSTANT_SCHEDULER,
+                    "lora": config.USE_LORA,
+                    "gradient acc": config.USE_GRADIENT_ACC,
+                    "batch_size": config.BATCH_SIZE,
+                    "MAX_SOURCE_LEN": config.MAX_SOURCE_LEN,
+                    "MAX_TARGET_LEN": config.MAX_TARGET_LEN,
+                    "epochs": config.EPOCHS,
+                    "dataset train": f"{config.DATASET_TRAIN}",
+                    "dataset test": f"{config.DATASET_TEST}",
+                    "dataset val": f"{config.DATASET_VAL}",
+                    "pretrained model":config.MODEL_PRETRAINED_ATE,
+                    "pretrained tokenizer":config.PRE_TRAINED_TOKENIZER_NAME,
+                    "model save path": config.MODEL_SAVE_PATH,
+                    "Accelerate used": "False",
+                    "Generate do_sample": gen_config.do_sample,
+                    "Generate temperature": gen_config.temperature,
+                    "Generate num_beams": gen_config.num_beams,
+                    "Generate no_repeat_ngram_size": gen_config.no_repeat_ngram_size,
+                })
+
+set_seed(config.SEED)
+df_train = pd.read_csv(config.DATASET_TRAIN)
+df_test = pd.read_csv(config.DATASET_TEST)
+df_val = pd.read_csv(config.DATASET_VAL)
+
+print('DF TRAIN:', len(df_train))
+print('DF TEST:', len(df_test))
+print('DF VAL:', len(df_val))
+
+df_train.dropna(subset=['text_cleaned'],inplace=True)
+df_test.dropna(subset=['text_cleaned'],inplace=True)
+df_val.dropna(subset=['text_cleaned'],inplace=True)
+
+punctuation = string.punctuation
+punctuation = re.sub('-','',punctuation)
+
+def f1(pred, target):
+      return f1_score(target, pred, average='weighted')
+
+def recall(pred, target):
+    pred = pred.split(';')
+    target = target.split(';')
+    
+    pred = [p.strip() for p in pred]
+    target = [p.strip() for p in target]
+
+    sum = 0
+    already_seen = []
+    for p in pred:
+        if p in target and p not in already_seen:
+            sum += 1
+            already_seen.append(p)
+    sum=sum/(len(target))
+    return sum
+
+def format_time(elapsed):
+    '''
+    Takes a time in seconds and returns a string hh:mm:ss
+    '''
+    elapsed_rounded = int(round((elapsed)))
+    return str(datetime.timedelta(seconds=elapsed_rounded))
+
+def remove_repeated_words(text):
+  words = text.split()
+  return " ".join(sorted(set(words), key=words.index))
+
+def load_model_and_tokenizer(
+                                model_path: str,
+                                load_in_8bits: bool,
+                                token: str,
+                                use_cpu: bool = False,
+                            ) -> tuple[AutoModelForCausalLM, PreTrainedTokenizerBase]:
+                                
+    bnb_config = None
+    if not use_cpu:
+        if load_in_8bits:
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=True,  # load model in 8-bit precision
+                low_cpu_mem_usage=True,
+            )
+            print("Loading model in 8-bit mode")
+        else:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,  # load model in 4-bit precision
+                bnb_4bit_quant_type="nf4",  # pre-trained model should be quantized in 4-bit NF format
+                bnb_4bit_use_double_quant=True,  # Using double quantization as mentioned in QLoRA paper
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            print("Loading model in 4-bit mode")
+    else:
+        print("Using CPU")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        quantization_config=bnb_config,
+        token=token,
+        low_cpu_mem_usage=True if not use_cpu else False,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path,
+                                              use_fast=False,
+                                              token=token)
+
+    return model, tokenizer
+
+model, tokenizer = load_model_and_tokenizer(
+                                            model_path=config.MODEL_PRETRAINED_ATE,
+                                            load_in_8bits= True,
+                                            token='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',
+                                            use_cpu= False)
+
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = "[PAD]"
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    model.resize_token_embeddings(len(tokenizer))
+    resized_embeddings = True
+
+lora_config = LoraConfig(
+                        r=64,
+                        lora_alpha=16,
+                        target_modules=['self_attn.q_proj','self_attn.v_proj'],  
+                        lora_dropout=0.1,
+                        bias="none",
+                        modules_to_save=None if not resized_embeddings else ["lm_head", "embed_tokens"],
+                        task_type=TaskType.CAUSAL_LM,
+                        use_rslora=True,
+                    )
+
+collator = DataCollatorForCompletionOnlyLM(
+                                    tokenizer=tokenizer,
+                                    response_template="assistant",
+                                )
+
+train_dataset = Dataset.from_pandas(df_train)
+val_dataset = Dataset.from_pandas(df_val)
+
+
+def format_as_chat_with_output(example):
+    messages =  [  
+            {"role": "user", "content": example["text_cleaned"]},  # User input
+            {"role": "assistant", "content": example["all_categories_old"]},  # Model response
+        ]
+    if hasattr(tokenizer, "apply_chat_template"):
+        formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    else:
+        formatted_text = f"User: {example['text_cleaned']}\n###assitant: {example['all_categories_old']}"
+
+    return formatted_text
+
+def format_as_chat_without_output(text_cleaned, add_system_msg=False):
+    if add_system_msg:
+        system_message = {
+            "role": "system",
+            "content": (
+                "You are an assistant specialized in extracting aspects from reviews. "
+                """Given a user's review, list all aspects categories that have corresponding opinions.
+                Review: <<I love how organized the store is, but the delivery was late.>>
+                Aspects: store organization; delivery"""
+            )
+        }
+        messages =  [ system_message, {"role": "user", "content": text_cleaned}] 
+    
+    else:
+        messages =  [ {"role": "user", "content": text_cleaned}] 
+        
+    if hasattr(tokenizer, "apply_chat_template"):
+        formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        if add_system_msg:
+            formatted_text = (
+                        f"System: {system_message['content']}\n"
+                        f"User: {text_cleaned}\n"
+                        f"###assistant:"
+                )
+        else:
+            formatted_text = f"User: {text_cleaned}\n###assitant: "
+        
+    return formatted_text
+
+class TestDataset(torch.utils.data.Dataset):
+    def __init__(self, df):
+        self.df = df
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        item = self.df.iloc[idx]
+        return {
+            'all_categories_old': item['all_categories_old'],
+            'input_ids' : item['input_ids'],
+            'attention_mask' : item['attention_mask']
+        }
+        
+def tokenize_test_example(example):
+    tokenized = tokenizer(example, 
+                          padding=False,  # We'll pad later in collate_fn
+                          truncation=True)
+    return tokenized['input_ids'], tokenized['attention_mask']
+
+def collate_test_fn(batch):
+    # `batch` is a list of dictionaries returned by `__getitem__`
+    input_ids = [torch.tensor(ex["input_ids"], dtype=torch.long) for ex in batch]
+    attention_masks = [torch.tensor(ex["attention_mask"], dtype=torch.long) for ex in batch]
+    refs = [ex["all_categories_old"] for ex in batch]
+
+    padded = tokenizer.pad(
+        {"input_ids": input_ids, "attention_mask": attention_masks},
+        padding=True,          # pad to max length in this batch
+        return_tensors="pt"
+    )
+    return {
+        "all_categories_old": refs,
+        "input_ids": padded["input_ids"],
+        "attention_mask": padded["attention_mask"]
+    }
+
+
+def evaluate_model(df_test, model, tokenizer):
+  bleu_metric = evaluate.load("bleu")
+  rouge_metric = evaluate.load("rouge")
+  tokenizer.padding_side = "left"
+  
+  df_test['text_formatted'] = df_test['text_cleaned'].apply(lambda x: format_as_chat_without_output(x))
+  df_test['input_ids'], df_test['attention_mask'] = zip(*df_test['text_formatted'].apply(lambda x: tokenize_test_example(x)))
+  test_dataloader = DataLoader(TestDataset(df_test), 
+                             batch_size=config.BATCH_SIZE,
+                             collate_fn=collate_test_fn)
+
+  print('Evaluating model...')
+  model.eval()
+
+  preds = []
+  refs = []
+  recalls = []
+  
+  for batch in test_dataloader: 
+    input_ids = batch['input_ids'].to(model.device)
+    attention_mask = batch['attention_mask'].to(model.device)
+    references = batch['all_categories_old']
+    
+    with torch.no_grad():
+      outputs = model.generate(input_ids=input_ids,
+                               attention_mask=attention_mask,
+                                max_new_tokens = config.MAX_TARGET_LEN,
+                                return_dict_in_generate=True,
+                                output_scores=True,
+                                do_sample=False,
+                                num_beams=1,
+                                temperature=0,
+                                num_return_sequences=1,
+                                no_repeat_ngram_size=4,
+                               ) # GenerateBeamDecoderOnlyOutput
+    # contains:
+    #   outputs.sequences        -> the generated token IDs
+    #   outputs.sequences_scores -> log probability scores for each sequence
+    #   outputs.scores           -> a list of token-level logit distributions
+    
+    predictions = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
+    log_probs = outputs.sequences  # shape: [batch_size * num_return_sequences]. Values are in log space. Higher value is better
+    try:
+        probs = torch.exp(log_probs)
+    except:
+        probs = log_probs
+    # prompt_lengths = (input_ids != tokenizer.pad_token_id).sum(dim=1)
+    # cleaned_outputs = []
+    # for seq, p_len in zip(outputs.sequences, prompt_lengths):
+    #     new_token_ids = seq[p_len:]  # slice out prompt
+    #     cleaned_outputs.append(new_token_ids)
+    # cleaned_outputs = [
+    #                     tokenizer.decode(ids, skip_special_tokens=True)
+    #                     for ids in cleaned_outputs
+    #                 ]
+
+    cleaned_outputs = []
+    for text in predictions:
+        response_start = text.find("assistant")
+        if response_start != -1:
+            text = text[response_start + len("assistant"):].strip()
+        cleaned_outputs.append(text)
+    
+    print('New texts generated:')
+    for text, ref, prob in zip(cleaned_outputs, refs, probs):
+        print('Reference:', ref)
+        print('Prediction:',text,
+              '\nScore:',
+              prob.item(),
+              '\n',
+              '-'*20)
+        
+    preds.extend(cleaned_outputs)
+    refs.extend(references)
+    for pred, ref in zip(cleaned_outputs, references):
+        recalls.append(recall(pred=pred,target=ref))
+  
+  result_rouge = rouge_metric.compute(predictions=preds, 
+                                      references=refs)
+  result_bleu = bleu_metric.compute(predictions=preds, 
+                                    references=[[ref] for ref in refs])
+  result_f1 = f1_score(refs, preds, average='weighted')
+  result_recall = np.mean(recalls)
+
+  print("Prediction:", preds)
+  print("Reference:", refs)
+  print("ROUGE:", result_rouge)
+  print("BLEU:", result_bleu)
+  print("F1:", result_f1)
+  print("Recall:", result_recall)
+
+training_args = TrainingArguments(
+        output_dir="logs",
+        per_device_train_batch_size=config.BATCH_SIZE,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.LR[config.LR_IDX],
+        logging_steps=10,
+        num_train_epochs=config.EPOCHS,
+        optim="adamw_8bit",
+        report_to="wandb",
+        run_name=config.WANDB_INIT_NAME,
+        lr_scheduler_type="constant",
+        max_grad_norm=0.3,
+        warmup_ratio=0.03,
+        bf16=False,
+        tf32=True if not use_cpu else False,
+        save_strategy="epoch",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        evaluation_strategy="epoch",
+        use_cpu=False,
+        remove_unused_columns=True,
+        load_best_model_at_end=True,
+        save_total_limit=1,
+        metric_for_best_model="eval_loss",
+        disable_tqdm=False,
+        group_by_length=False,
+        dataloader_drop_last=False,
+        dataloader_num_workers=4,
+        eval_on_start=True,
+        # use_liger_kernel=True #check
+    )
+
+try:
+    print('Initialising trainer..')
+    trainer = SFTTrainer(
+                            train_dataset=train_dataset,
+                            eval_dataset=val_dataset,
+                            model=model,
+                            peft_config=lora_config,
+                            tokenizer=tokenizer,
+                            args=training_args,
+                            data_collator=collator,
+                            formatting_func=format_as_chat_with_output,
+                        )
+
+    print('Start training...')
+    trainer.train()
+    print('Training finished')
+    trainer.save_model(config.MODEL_SAVE_PATH)
+    print('Model saved')
+
+    print('Testing the model...')
+    evaluate_model(df_test=df_test,
+                   model=trainer.model,
+                   tokenizer=tokenizer)
+    print('Evaluation finished')
+
+except Exception as e:
+  print(e)
