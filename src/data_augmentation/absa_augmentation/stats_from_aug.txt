@@ -1,0 +1,32 @@
+Len dataframe with text_bt_RoEnRo: 1751
+Len dataframe with text_bt_RoEnChRo: 1751
+Len dataframe with both BT: 3502
+Len dataframe with both BT (duplicates removed): 3502
+manual                  5138
+random-concatenation    1655
+Name: data_origin, dtype: int64
+
+Len dataframe with only concatenations: 1655
+Len dataframe with only concatenations (duplicates removed): 1655
+
+manual    1751
+Name: data_origin, dtype: int64
+Len dataframe with only c-mlm: 1751
+Len dataframe with only c-mlm (duplicates removed): 1751
+Len dataframe with all augmentations: 6908
+Len dataframe with all augmentations (duplicates removed): 6908
+
+bt_1chain               1751
+bt_2chain               1751
+c-mlm                   1751
+random-concatenation    1655
+Name: data_origin, dtype: int64
+LEN original pairs ABSA: 5138
+LEN original pairs ABSA + augmented pairs : 12046
+LEN original pairs ABSA + augmented pairs (removed duplicates) : 12046
+manual                  5138
+bt_1chain               1751
+bt_2chain               1751
+c-mlm                   1751
+random-concatenation    1655
+Name: data_origin, dtype: int64
