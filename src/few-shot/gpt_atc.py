@@ -1,0 +1,39 @@
+import pandas as pd
+import re
+from openai import OpenAI
+
+def retrieve_gpt_predictions(few_shot_df: pd.DataFrame
+			   , test_df: pd.DataFrame
+			   , model: str = "gpt-4o") -> pd.DataFrame:
+
+    df_merged = few_shot_df.merge(test_df, on='text', how='outer', indicator=True)
+    
+    true_labels_list = []
+    pred_labels_list = []
+    
+    for index, row in df_merged.iterrows():
+        response = client.chat.completions.create(
+          model=model,
+          messages=[
+            {
+              "role": "system",
+              "content": row['few_shot_prompt_gpt']
+            },
+            {
+                "role": "user",
+                "content": f"review: {row['text']}"
+            }
+          ]
+        )
+    
+        output = str(response.choices[0].message)
+        match = re.search(r"content='(.*?)'", output)
+
+        if match:
+          aspects = match.group(1)
+        aspects = aspects.split('; ')    
+        true_labels = true_labels.split('; ')
+        pred_labels = aspects.split('; ')
+    
+        true_labels_list.append(true_labels)
+        pred_labels_list.append(pred_labels)
