@@ -1,6 +1,4 @@
-import re
 import datetime
-import string
 import wandb
 import torch
 import string
@@ -8,6 +6,7 @@ import evaluate
 import random
 import nltk
 import os
+import torch, gc
 
 import numpy as np
 import pandas as pd
@@ -20,19 +19,34 @@ from transformers import (BitsAndBytesConfig,
                           TrainingArguments,
                           )
 from peft import (LoraConfig, 
-                  TaskType 
-                )
-from torch.utils.data import TensorDataset
+                  TaskType, 
+                  )           
+
+from transformers import EarlyStoppingCallback
 
 from peft import LoraConfig
 from trl import DataCollatorForCompletionOnlyLM, SFTTrainer
-from transformers import DataCollatorWithPadding
 from huggingface_hub import login
-login(token="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")
+login(token="xxx")
 
 nltk.download('punkt')
 torch.set_warn_always(True)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import argparse
+
+parser = argparse.ArgumentParser(description="Script configuration")
+parser.add_argument("--model", type=str, default='', help="Pretrained model name") # 
+parser.add_argument("--batch", type=int, default=4, help="Batch size")
+parser.add_argument("--acc_steps", type=int, default=2, help="Gradient accumulation steps")
+parser.add_argument("--use_lora", type=str, default='no', help="Use Lora or Not")
+parser.add_argument("--epochs", type=int, default=10, help="Number of Epochs")
+parser.add_argument("--version", type=int, default=3, help="Version for model's name saved")
+parser.add_argument("--description", type=str, default='', help="Will be placed in wandb run description")
+parser.add_argument("--aug", type=str, default='', help="Augmentation type to include. Values: all/bt/c-mlm/rc/rephrasing/quad2text_trained/rephrasing+quad2text")
+
+args = parser.parse_args()
+print(f'Task Running for model: {args.model}, batch size: {args.batch}, gradient accumulation steps: {args.acc_steps}, using lora: {args.use_lora}')
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -48,51 +62,53 @@ class config:
   DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
   
   ROOT = os.getcwd()
-  DATASET_TRAIN = ROOT + os.sep +'data/new_data/atc/roabsa_train.csv'
+  DATASET_TRAIN = ROOT + os.sep +'data/new_data/atc/roabsa_train_aug_final.csv'
   DATASET_TEST = ROOT + os.sep +'data/new_data/atc/roabsa_test.csv'
   DATASET_VAL = ROOT + os.sep +'data/new_data/atc/roabsa_eval.csv'
-  
-  MODEL_SAVE_PATH = ROOT + os.sep +'models/new_models/atc_llama_v2.pt' 
-  MODEL_PRETRAINED_ATE ='meta-llama/Llama-3.1-8B-Instruct' 
-  PRE_TRAINED_TOKENIZER_NAME ='meta-llama/Llama-3.1-8B-Instruct'
-  WANDB_INIT_NAME = "llama-3.1-8B-Instruct"
+  tag = args.model.split('/')[-1]
+  version = str(args.version)
+  MODEL_SAVE_PATH = ROOT + os.sep + f'models/new_models/atc_aug_{tag}_causal_v{version}.pt' 
+
+  MODEL_PRETRAINED_ATE = args.model 
+  PRE_TRAINED_TOKENIZER_NAME = args.model
+  WANDB_INIT_NAME = args.model + '-aug-' + args.aug 
   
   MAX_SOURCE_LEN = 512
-  MAX_TARGET_LEN = 512
+  MAX_TARGET_LEN = 32
   
-  BATCH_SIZE = 4
-  EPOCHS = 10
+  BATCH_SIZE = args.batch
+  EPOCHS = args.epochs
   LR = [3e-5, 1e-4, 2e-4, 3e-4]
   LR_IDX = 0
   EPS = 1e-5
   
-  gradient_accumulation_steps = 2
-  label_smoothing = 0.1 # 0.0 if we do not use label smoothing for lowering the prediction confidence.
+  gradient_accumulation_steps = args.acc_steps
   
   USE_LABEL_SMOOTHING = False
   USE_GRADIENT_ACC = False
-  USE_LORA = True
-  USE_CONSTANT_SCHEDULER = True
-
+  if args.use_lora=='yes':
+    USE_LORA = True
+  else:
+    USE_LORA = False
+  USE_CONSTANT_SCHEDULER = False
 
 use_cpu = False
 resized_embeddings = False
+
 gen_config = GenerationConfig(
     max_new_tokens = config.MAX_TARGET_LEN,
     return_dict_in_generate=True,
     output_scores=True,
     do_sample=False,
-    num_beams=1,
-    temperature=0,
+    num_beams=30,
+    length_penalty=0,
+    repetition_penalty=1.2,
     num_return_sequences=1,
-    no_repeat_ngram_size=4,
+    no_repeat_ngram_size=5,
 )
 
-
-wandb.init(project="new_roabsa_atc", name=config.WANDB_INIT_NAME,
+wandb.init(project="final_new_roabsa_atc", name=config.WANDB_INIT_NAME,
             config={
-                    "Target": "all categories",
-                    "Description": "Train ATC model with output pairs: <ATC1 is Pol1; ...;ATCn is PolN>",
                     "learning rate": config.LR[config.LR_IDX],
                     "optimizer": "adam",
                     "use label smoothing": config.USE_LABEL_SMOOTHING,
@@ -111,8 +127,9 @@ wandb.init(project="new_roabsa_atc", name=config.WANDB_INIT_NAME,
                     "model save path": config.MODEL_SAVE_PATH,
                     "Accelerate used": "False",
                     "Generate do_sample": gen_config.do_sample,
-                    "Generate temperature": gen_config.temperature,
-                    "Generate num_beams": gen_config.num_beams,
+                    "Generate beams": gen_config.num_beams,
+                    "Generate length penalty": gen_config.length_penalty,
+                    "Generate repetition_penalty": gen_config.repetition_penalty,
                     "Generate no_repeat_ngram_size": gen_config.no_repeat_ngram_size,
                 })
 
@@ -121,16 +138,54 @@ df_train = pd.read_csv(config.DATASET_TRAIN)
 df_test = pd.read_csv(config.DATASET_TEST)
 df_val = pd.read_csv(config.DATASET_VAL)
 
-print('DF TRAIN:', len(df_train))
-print('DF TEST:', len(df_test))
-print('DF VAL:', len(df_val))
 
-df_train.dropna(subset=['text_cleaned'],inplace=True)
-df_test.dropna(subset=['text_cleaned'],inplace=True)
-df_val.dropna(subset=['text_cleaned'],inplace=True)
+def select_train_instances(df_train):
+    if args.aug=='c-mlm':
+        df_train = df_train[df_train['data_origin'].isin(['manual','c-mlm'])]
 
-punctuation = string.punctuation
-punctuation = re.sub('-','',punctuation)
+    if args.aug=='rc':
+        df_train = df_train[df_train['data_origin'].isin(['manual','random-concatenation'])]
+
+    if args.aug=='bt':
+        df_train = df_train[df_train['data_origin'].isin(['manual','bt_1chain_RoFrRo','bt_2chain_RoFrChzRo','bt_2chain_RoEnChzRo'])]
+        
+    if args.aug=='rephrasing':
+        df_train = df_train[df_train['data_origin'].isin(['manual','rephrasing'])]
+
+    if args.aug=='quad2text':
+        df_train = df_train[df_train['data_origin'].isin(['manual','quad2text_trained'])]
+    
+    if args.aug=='rephrasing+quad2text':
+        df_train = df_train[df_train['data_origin'].isin(['manual','quad2text_trained','rephrasing'])]
+        
+    return df_train
+
+
+def remove_prompt(text):
+    prompt = "Extract pairs of aspect categories with their corresponding opinions from the following Romanian review:"
+    
+    if prompt in text:
+        text = text.replace(prompt,'')
+    
+    eos_token_t5 = '</s>'
+    bos_token_t5 = '<s>'
+    
+    if eos_token_t5 in text:
+        text = text.replace(eos_token_t5,'')
+    
+    if bos_token_t5 in text:
+        text = text.replace(bos_token_t5,'')
+        
+    return text.strip()
+
+df_train['text_cleaned'] = df_train['text_cleaned'].apply(remove_prompt)
+df_val['text_cleaned'] = df_val['text_cleaned'].apply(remove_prompt)
+df_test['text_cleaned'] = df_test['text_cleaned'].apply(remove_prompt)
+
+if args.aug and args.aug!='all':
+    df_train = select_train_instances(df_train)
+
+print('\n',df_train['data_origin'].value_counts(),'\n\n')
 
 def f1(pred, target):
       return f1_score(target, pred, average='weighted')
@@ -150,6 +205,30 @@ def recall(pred, target):
             already_seen.append(p)
     sum=sum/(len(target))
     return sum
+
+
+def precision(pred, target):
+    pred = pred.split(';')
+    target = target.split(';')
+    
+    pred = [p.strip() for p in pred]
+    target = [p.strip() for p in target]
+
+    correct = 0
+    already_seen = []
+    for p in pred:
+        if p in target and p not in already_seen:
+            correct += 1
+            already_seen.append(p)
+    
+    return correct / len(pred) if len(pred) > 0 else 0
+
+
+def label_f1(precision, recall):
+    if precision + recall == 0:
+        return 0  
+    return 2 * (precision * recall) / (precision + recall)
+
 
 def format_time(elapsed):
     '''
@@ -190,13 +269,13 @@ def load_model_and_tokenizer(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        quantization_config=bnb_config,
         token=token,
         low_cpu_mem_usage=True if not use_cpu else False,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_path,
                                               use_fast=False,
+                                              padding_side="left", #added
                                               token=token)
 
     return model, tokenizer
@@ -204,14 +283,10 @@ def load_model_and_tokenizer(
 model, tokenizer = load_model_and_tokenizer(
                                             model_path=config.MODEL_PRETRAINED_ATE,
                                             load_in_8bits= True,
-                                            token='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',
+                                            token='xxx',
                                             use_cpu= False)
 
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = "[PAD]"
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    model.resize_token_embeddings(len(tokenizer))
-    resized_embeddings = True
+tokenizer.add_eos_token=False  # only for mistral
 
 lora_config = LoraConfig(
                         r=64,
@@ -224,40 +299,37 @@ lora_config = LoraConfig(
                         use_rslora=True,
                     )
 
+
 collator = DataCollatorForCompletionOnlyLM(
                                     tokenizer=tokenizer,
-                                    response_template="assistant",
-                                )
-
+                                    mlm=False,
+                                    return_tensors="pt",
+                                    response_template="<|start_header_id|>assistant<|end_header_id|>",
+                                ) 
 train_dataset = Dataset.from_pandas(df_train)
 val_dataset = Dataset.from_pandas(df_val)
 
 
 def format_as_chat_with_output(example):
     messages =  [  
+            {"role": "system", "content": "You are an expert linguist specialized in extracting categories of aspect terms identified in reviews."},
             {"role": "user", "content": example["text_cleaned"]},  # User input
-            {"role": "assistant", "content": example["all_categories_old"]},  # Model response
+            {"role": "assistant", "content": example["all_categories"]},  # Model response
         ]
-    if hasattr(tokenizer, "apply_chat_template"):
-        formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    else:
-        formatted_text = f"User: {example['text_cleaned']}\n###assitant: {example['all_categories_old']}"
-
+    formatted_text = tokenizer.apply_chat_template(messages, 
+                                                    tokenize=False, 
+                                                    add_special_tokens=False,
+                                                    add_generation_prompt=False)
+    
     return formatted_text
 
-def format_as_chat_without_output(text_cleaned, add_system_msg=False):
+def format_as_chat_without_output(text_cleaned, add_system_msg=True):
     if add_system_msg:
         system_message = {
             "role": "system",
-            "content": (
-                "You are an assistant specialized in extracting aspects from reviews. "
-                """Given a user's review, list all aspects categories that have corresponding opinions.
-                Review: <<I love how organized the store is, but the delivery was late.>>
-                Aspects: store organization; delivery"""
-            )
+            "content": "You are an expert linguist specialized in extracting categories of aspect terms identified in reviews."
         }
-        messages =  [ system_message, {"role": "user", "content": text_cleaned}] 
-    
+        messages =  [system_message, {"role": "user", "content": text_cleaned}] 
     else:
         messages =  [ {"role": "user", "content": text_cleaned}] 
         
@@ -272,7 +344,7 @@ def format_as_chat_without_output(text_cleaned, add_system_msg=False):
                 )
         else:
             formatted_text = f"User: {text_cleaned}\n###assitant: "
-        
+    
     return formatted_text
 
 class TestDataset(torch.utils.data.Dataset):
@@ -285,22 +357,22 @@ class TestDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = self.df.iloc[idx]
         return {
-            'all_categories_old': item['all_categories_old'],
+            'all_categories': item['all_categories'],
             'input_ids' : item['input_ids'],
-            'attention_mask' : item['attention_mask']
+            'attention_mask' : item['attention_mask'],
         }
         
 def tokenize_test_example(example):
     tokenized = tokenizer(example, 
                           padding=False,  # We'll pad later in collate_fn
+                          return_tensors="pt",
                           truncation=True)
     return tokenized['input_ids'], tokenized['attention_mask']
 
 def collate_test_fn(batch):
-    # `batch` is a list of dictionaries returned by `__getitem__`
-    input_ids = [torch.tensor(ex["input_ids"], dtype=torch.long) for ex in batch]
-    attention_masks = [torch.tensor(ex["attention_mask"], dtype=torch.long) for ex in batch]
-    refs = [ex["all_categories_old"] for ex in batch]
+    input_ids = [ex["input_ids"] for ex in batch]
+    attention_masks = [ex["attention_mask"] for ex in batch]
+    refs = [ex["all_categories"] for ex in batch]
 
     padded = tokenizer.pad(
         {"input_ids": input_ids, "attention_mask": attention_masks},
@@ -308,7 +380,7 @@ def collate_test_fn(batch):
         return_tensors="pt"
     )
     return {
-        "all_categories_old": refs,
+        "all_categories": refs,
         "input_ids": padded["input_ids"],
         "attention_mask": padded["attention_mask"]
     }
@@ -317,10 +389,15 @@ def collate_test_fn(batch):
 def evaluate_model(df_test, model, tokenizer):
   bleu_metric = evaluate.load("bleu")
   rouge_metric = evaluate.load("rouge")
-  tokenizer.padding_side = "left"
   
-  df_test['text_formatted'] = df_test['text_cleaned'].apply(lambda x: format_as_chat_without_output(x))
-  df_test['input_ids'], df_test['attention_mask'] = zip(*df_test['text_formatted'].apply(lambda x: tokenize_test_example(x)))
+  df_test['text_formatted'] = df_test['text_cleaned'].apply(format_as_chat_without_output)
+  tokenized_outputs = tokenizer(df_test["text_formatted"].tolist(),
+                                padding=True,  
+                                truncation=True,
+                                return_tensors="pt")
+  df_test["input_ids"] = tokenized_outputs["input_ids"].tolist()
+  df_test["attention_mask"] = tokenized_outputs["attention_mask"].tolist()
+  
   test_dataloader = DataLoader(TestDataset(df_test), 
                              batch_size=config.BATCH_SIZE,
                              collate_fn=collate_test_fn)
@@ -330,45 +407,31 @@ def evaluate_model(df_test, model, tokenizer):
 
   preds = []
   refs = []
+  
   recalls = []
+  precisions = []
+  f1_instance_level = []
   
   for batch in test_dataloader: 
     input_ids = batch['input_ids'].to(model.device)
     attention_mask = batch['attention_mask'].to(model.device)
-    references = batch['all_categories_old']
+    references = batch['all_categories']
     
     with torch.no_grad():
       outputs = model.generate(input_ids=input_ids,
-                               attention_mask=attention_mask,
+                               attention_mask= attention_mask,
                                 max_new_tokens = config.MAX_TARGET_LEN,
                                 return_dict_in_generate=True,
                                 output_scores=True,
-                                do_sample=False,
-                                num_beams=1,
-                                temperature=0,
+                                num_beams=30,
+                                length_penalty=0,
+                                repetition_penalty=1.2,
                                 num_return_sequences=1,
-                                no_repeat_ngram_size=4,
-                               ) # GenerateBeamDecoderOnlyOutput
-    # contains:
-    #   outputs.sequences        -> the generated token IDs
-    #   outputs.sequences_scores -> log probability scores for each sequence
-    #   outputs.scores           -> a list of token-level logit distributions
-    
+                                no_repeat_ngram_size=5,
+                                pad_token_id = tokenizer.pad_token_id
+                               )  
+      
     predictions = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
-    log_probs = outputs.sequences  # shape: [batch_size * num_return_sequences]. Values are in log space. Higher value is better
-    try:
-        probs = torch.exp(log_probs)
-    except:
-        probs = log_probs
-    # prompt_lengths = (input_ids != tokenizer.pad_token_id).sum(dim=1)
-    # cleaned_outputs = []
-    # for seq, p_len in zip(outputs.sequences, prompt_lengths):
-    #     new_token_ids = seq[p_len:]  # slice out prompt
-    #     cleaned_outputs.append(new_token_ids)
-    # cleaned_outputs = [
-    #                     tokenizer.decode(ids, skip_special_tokens=True)
-    #                     for ids in cleaned_outputs
-    #                 ]
 
     cleaned_outputs = []
     for text in predictions:
@@ -377,19 +440,19 @@ def evaluate_model(df_test, model, tokenizer):
             text = text[response_start + len("assistant"):].strip()
         cleaned_outputs.append(text)
     
-    print('New texts generated:')
-    for text, ref, prob in zip(cleaned_outputs, refs, probs):
-        print('Reference:', ref)
-        print('Prediction:',text,
-              '\nScore:',
-              prob.item(),
-              '\n',
-              '-'*20)
-        
     preds.extend(cleaned_outputs)
     refs.extend(references)
+    
+    print("\nPrediction:", cleaned_outputs)
+    print("Reference:", references)
+    
     for pred, ref in zip(cleaned_outputs, references):
-        recalls.append(recall(pred=pred,target=ref))
+        current_recall = recall(pred=pred, target=ref)
+        current_precision = precision(pred=pred, target=ref)
+        recalls.append(current_recall)
+        precisions.append(current_precision)
+        f1_instance_level.append(label_f1(precision=current_precision, recall=current_recall))
+        
   
   result_rouge = rouge_metric.compute(predictions=preds, 
                                       references=refs)
@@ -397,17 +460,40 @@ def evaluate_model(df_test, model, tokenizer):
                                     references=[[ref] for ref in refs])
   result_f1 = f1_score(refs, preds, average='weighted')
   result_recall = np.mean(recalls)
+  result_precision = np.mean(precisions)
+  result_f1_instance_level = np.mean(f1_instance_level)
 
-  print("Prediction:", preds)
-  print("Reference:", refs)
-  print("ROUGE:", result_rouge)
-  print("BLEU:", result_bleu)
+  print("\nROUGE:", result_rouge)
+  print("BLEU:", result_bleu['bleu'])
+  print("BLEU precisions:", result_bleu['precisions'])
   print("F1:", result_f1)
   print("Recall:", result_recall)
+  print("Precision:", result_precision)
+  print("Result F1 instance level:", result_f1_instance_level)
+  
+  wandb.log({
+      'Test Rouge R1':result_rouge['rouge1'],
+      'Test Rouge R2':result_rouge['rouge2'],
+      'Test Rouge L':result_rouge['rougeL'],
+      'Test Bleu':result_bleu['bleu'],
+      'Test Bleu precisions':np.mean(result_bleu['precisions']), 
+      'Test F1':result_f1,
+      'Test Recall':result_recall,
+      'Test Precision': result_precision,
+      'Test F1 instance level': result_f1_instance_level
+  })
+
+
+early_stopping = EarlyStoppingCallback(
+    early_stopping_patience=3,  # Stop training if no improvement after 3 evals
+    early_stopping_threshold=0.01  # Require at least 0.01 improvement in eval_loss
+)
+
 
 training_args = TrainingArguments(
-        output_dir="logs",
+        output_dir=f"logs_{config.WANDB_INIT_NAME}",
         per_device_train_batch_size=config.BATCH_SIZE,
+        per_device_eval_batch_size=config.BATCH_SIZE,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.LR[config.LR_IDX],
         logging_steps=10,
@@ -415,9 +501,10 @@ training_args = TrainingArguments(
         optim="adamw_8bit",
         report_to="wandb",
         run_name=config.WANDB_INIT_NAME,
-        lr_scheduler_type="constant",
-        max_grad_norm=0.3,
-        warmup_ratio=0.03,
+        lr_scheduler_type="cosine",
+        weight_decay=0.01,
+        max_grad_norm=1,
+        warmup_ratio=0.1,
         bf16=False,
         tf32=True if not use_cpu else False,
         save_strategy="epoch",
@@ -432,8 +519,7 @@ training_args = TrainingArguments(
         disable_tqdm=False,
         group_by_length=False,
         dataloader_drop_last=False,
-        dataloader_num_workers=4,
-        eval_on_start=True,
+        dataloader_num_workers=128,
         # use_liger_kernel=True #check
     )
 
@@ -447,20 +533,27 @@ try:
                             tokenizer=tokenizer,
                             args=training_args,
                             data_collator=collator,
-                            formatting_func=format_as_chat_with_output,
+                            formatting_func=format_as_chat_with_output,  
+                            callbacks=[early_stopping]
                         )
 
     print('Start training...')
     trainer.train()
     print('Training finished')
     trainer.save_model(config.MODEL_SAVE_PATH)
-    print('Model saved')
-
+    print(f'Model saved to: {config.MODEL_SAVE_PATH}')
+    del model
+    del train_dataset
+    del val_dataset
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     print('Testing the model...')
     evaluate_model(df_test=df_test,
                    model=trainer.model,
                    tokenizer=tokenizer)
     print('Evaluation finished')
+    wandb.finish()
 
 except Exception as e:
   print(e)
