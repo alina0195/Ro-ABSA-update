@@ -32,5 +32,4 @@ def create_df_with_one_pair(df, filename_save):
     new_df.to_csv(filename_save, index=False)
     return new_df
 
-# create_df_with_one_pair(df_test,'df_testval_one_pair.csv')
-create_df_with_one_pair(df,'df_train_one_pair_allLblData.csv')
+create_df_with_one_pair(df,'train_alsa.csv')
