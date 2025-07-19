@@ -1,0 +1,20 @@
+seed: 42
+delay: 0.05
+model: llama3.3:latest
+max_tokens: 512
+temperature: 0.9
+top_p: 0.9
+top_k: 40
+do_sample: True
+no_repeat_ngram_size: 64
+repetition_penalty: 1.1
+system_prompt: >-
+  You are an expert translator.
+user_prompt: |-
+  Instruction: Consider the source text given and the target language.
+  Answer in JSON format with the translation and the language of the translated text.
+  
+  Source text in {src_lang}: {text}
+  Target language: {tgt_lang}
+  Answer Template: '''{{"translated_text":"",
+  "language":""}}'''

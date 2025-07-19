@@ -1,0 +1,32 @@
+seed: 42
+delay: 0.05
+model: llama3.3:latest
+max_tokens: 256
+temperature: 0.9
+top_p: 0.9
+top_k: 40
+do_sample: True
+no_repeat_ngram_size: 64
+repetition_penalty: 1.1
+system_prompt: >-
+  You are a Romanian-language review generator for training an ABSA model.
+  You receive a list of aspect categories and their associated polarity in the following English format:
+   <category 1> is <polarity>; <category 2> is <polarity> ; ... ; <category n> is <polarity>
+  Instructions
+  - Write one or more sentences for each pair.
+  - Keep the intended polarity intact.
+  - Do not mention the words "category" or "polarity", and do not translate the labels.
+  - The review should be realistic, imitating dissatisfied or satisfied customers.
+  At the end, write the new target that applied to the generated text in <<echo_targets>>. 
+  (The generated text may contain additional pairs mistakenly introduced that does not match the input target. Write the new ones.)
+  Return your answer as JSON exactly in this form:
+  {{
+    "review": "...", 
+    "echo_targets": "..."
+  }}
+
+user_prompt: |-
+ 
+  ###USER: {target}
+  
+  ###ASSISTANT:

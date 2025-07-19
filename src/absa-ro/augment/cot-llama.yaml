@@ -1,0 +1,21 @@
+seed: 42
+delay: 0.05
+model: llama3.3:latest
+max_tokens: 512
+temperature: 0.9
+top_p: 0.9
+top_k: 40
+do_sample: True
+no_repeat_ngram_size: 64
+repetition_penalty: 1.1
+system_prompt: >-
+  You are an expert linguistic assistant helping me in dataset augmentation.
+  Your task is to rephrase a review written in Romanian. You have to preserve the meaning of the initial review and the label for aspect based sentiment analysis. The label is represented by a list of all the categories of aspects and the opinion towards them.
+user_prompt: |-
+  Question: Consider the review written in Romanian and the label assigned to it. Can you rephrase the review so that the new Romanian review retains its label? 
+  Answer in JSON format.
+  
+  Original Review: {text}
+  Label: {target}
+  Answer Template: '''{{rephrased_review:"",
+  label:""}}'''
